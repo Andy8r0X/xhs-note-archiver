@@ -1,27 +1,24 @@
 // ==UserScript==
-// @name         小红书笔记存档 XHS Note Archiver
+// @name         小红书笔记存档 XHS Note Archiver (含视频/图片/正文)
 // @namespace    https://github.com/firmamento73/xhs-note-archiver
-// @version      1.0.0
-// @description  把当前笔记的图片和正文存到指定文件夹，每篇一个子目录。不调用任何分页接口。
-// @match        https://www.xiaohongshu.com/*
+// @version      1.2.0
+// @description  把当前笔记的图片、视频和正文存到指定文件夹，每篇一个子目录。不调用任何分页接口。
+// @match        *://*.rednote.com/*
+// @match        *://*.xiaohongshu.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_download
 // @connect      xhscdn.com
+// @connect      rednotecdn.com
+// @connect      xhslink.com
 // @run-at       document-idle
-// @author       firmamento73
+// @author       firmamento73 (Modified)
 // @license      MIT
-// @homepageURL  https://github.com/firmamento73/xhs-note-archiver
-// @supportURL   https://github.com/firmamento73/xhs-note-archiver/issues
-// @downloadURL  https://raw.githubusercontent.com/firmamento73/xhs-note-archiver/main/xhs-note-archiver.user.js
-// @updateURL    https://raw.githubusercontent.com/firmamento73/xhs-note-archiver/main/xhs-note-archiver.user.js
 // ==/UserScript==
 
 /*
- * 设计前提：不主动发起任何 xiaohongshu.com 的 API 请求。
- *   - 正文/作者/标签/评论  → 读页面已有的 __INITIAL_STATE__，纯内存，零请求
- *   - 图片                → 只打 xhscdn.com（静态 CDN，与站内 API 风控无关）
- * 所以不会触发 300013 限流。评论只能拿到当前页面已加载的部分，
- * 想多要就自己往下滚几屏、点开想留的回复，再点下载。
+ * 设计前提：不主动发起任何 xiaohongshu.com / rednote.com 的 API 请求。
+ *   - 正文/作者/标签/评论  → 读页面已有的 __INITIAL_STATE__ 与 meta，纯内存，零请求
+ *   - 图片/视频          → 只打静态 CDN，不触发站内风控
  */
 
 (function () {
@@ -29,15 +26,16 @@
 
   const CONFIG = {
     saveText: true,
-    saveJson: false,        // 额外存原始 note 数据，方便以后改格式或做本地检索
-    convertToPng: false,    // webp 转 png，体积涨 2~4 倍
-    txtCRLF: true,          // \r\n 换行，记事本友好
-    skipExisting: true,     // 同名图片已存在就跳过，重复点不白下
-    imageDelay: 400,        // 图片之间的间隔（毫秒）
+    saveJson: false,         // 额外存原始 note 数据
+    saveVideoCover: false,   // 视频笔记是否同时保存封面图
+    convertToPng: false,     // webp 转 png
+    txtCRLF: true,           // \r\n 换行，记事本友好
+    skipExisting: true,      // 同名文件已存在就跳过
+    imageDelay: 400,         // 图片之间的间隔（毫秒）
 
     comments: {
-      minLikes: 0,          // 点赞门槛，0 = 全要
-      maxCount: 0,          // 按点赞取前 N，0 = 不限
+      minLikes: 0,
+      maxCount: 0,
       keepSubComments: true,
       subMinLikes: 0,
     },
@@ -98,28 +96,75 @@
   const noteIdFromUrl = () =>
     (location.pathname.match(/\/(?:explore|discovery\/item)\/([0-9a-f]{20,32})/) || [])[1];
   const strip = (u) => u.split('!')[0].split('?')[0];
+  const toHttps = (u) => (typeof u === 'string' ? u.replace(/^http:\/\//i, 'https://') : '');
 
   function urlCandidates(img) {
     const info = img.infoList || [];
     const dft = info.find((i) => i.imageScene === 'WB_DFT');
     const raw = [dft && dft.url, img.urlDefault, ...info.map((i) => i.url), img.urlPre].filter(Boolean);
     const list = [];
-    for (const u of raw) list.push(strip(u), u);   // 先试去掉 ! 后缀的原图，不行再用原样
-    if (img.traceId) list.push(`https://sns-img-qc.xhscdn.com/${img.traceId}`);
+    for (const u of raw) {
+      const hu = toHttps(u);
+      list.push(strip(hu), hu);
+    }
+    if (img.traceId) {
+      list.push(`https://sns-img-qc.xhscdn.com/${img.traceId}`);
+      list.push(`https://sns-img-qc.rednotecdn.com/${img.traceId}`);
+    }
     return [...new Set(list)];
+  }
+
+  // 针对新版 EF4/h264/originVideoKey 与 og:video 的完整视频提取
+  function videoCandidates(note) {
+    const list = [];
+    const videoObj = note.video || {};
+
+    // 1. 优先尝试无水印源视频 Key (originVideoKey)
+    const originKey = videoObj.consumer && videoObj.consumer.originVideoKey;
+    if (originKey) {
+      list.push(`https://sns-video-bd.xhscdn.com/${originKey}`);
+      list.push(`https://sns-video-bd.rednotecdn.com/${originKey}`);
+    }
+
+    // 2. 动态遍历 media.stream 下的所有编码格式 (包含 EF4, EF5, EF6, EF7, h264, h265, av1 等)
+    const mediaStreams = videoObj.media && videoObj.media.stream;
+    if (mediaStreams && typeof mediaStreams === 'object') {
+      Object.values(mediaStreams).forEach((arr) => {
+        if (Array.isArray(arr)) {
+          // 若有多条流，优先按码率(avgBitrate)或画质排序
+          const sorted = arr.slice().sort((a, b) => (b.avgBitrate || 0) - (a.avgBitrate || 0));
+          sorted.forEach((stream) => {
+            if (stream && stream.masterUrl) list.push(toHttps(stream.masterUrl));
+            if (stream && Array.isArray(stream.backupUrls)) {
+              stream.backupUrls.forEach((bu) => list.push(toHttps(bu)));
+            }
+          });
+        }
+      });
+    }
+
+    // 3. 保底读取页面 <meta name="og:video"> 标签
+    const ogVideo = document.querySelector('meta[name="og:video"], meta[property="og:video"]');
+    if (ogVideo && ogVideo.content) {
+      list.push(toHttps(ogVideo.content));
+    }
+
+    if (videoObj.url) list.push(toHttps(videoObj.url));
+
+    return [...new Set(list.filter(Boolean))];
   }
 
   function readState() {
     const st = W.__INITIAL_STATE__;
     const map = st && st.note && st.note.noteDetailMap;
     if (!map) return null;
-    const id = noteIdFromUrl();
+    const id = noteIdFromUrl() || st.note.currentNoteId || st.note.firstNoteId;
     const entry = (id && map[id]) ||
-      Object.values(map).find((v) => v && v.note && v.note.imageList && v.note.imageList.length);
+      Object.values(map).find((v) => v && v.note && (v.note.imageList || v.note.video));
     if (!entry || !entry.note) return null;
     return {
       note: entry.note,
-      comments: (entry.comments && entry.comments.list) || [],  // 只有页面已加载的那些
+      comments: (entry.comments && entry.comments.list) || [],
       id: entry.note.noteId || id || '',
     };
   }
@@ -175,7 +220,7 @@
   (async () => {
     if (FSA_OK) { try { rootHandle = (await idbGet(KEY)) || null; } catch (e) {} }
     refreshChips();
-    setInterval(refreshChips, 2000);   // 你手动滚出新评论时，数字跟着更新
+    setInterval(refreshChips, 2000);
   })();
 
   /* ==================== 评论筛选（纯本地） ==================== */
@@ -195,7 +240,7 @@
       out = out.slice()
         .sort((a, b) => num(b.likeCount) - num(a.likeCount))
         .slice(0, c.maxCount)
-        .sort((a, b) => order.get(a.id) - order.get(b.id));   // 取完热门还原楼层顺序
+        .sort((a, b) => order.get(a.id) - order.get(b.id));
     }
     return out.map((x) => Object.assign({}, x, {
       subComments: c.keepSubComments ? (x.subComments || []).filter((s) => num(s.likeCount) >= c.subMinLikes) : [],
@@ -237,7 +282,8 @@
     L.push(`作者：${u.nickname || '?'}${u.userId ? '  (' + u.userId + ')' : ''}`);
     L.push(`发布：${fmtDate(n.time)}${n.ipLocation ? '  IP ' + n.ipLocation : ''}`);
     L.push(`互动：赞 ${it.likedCount || 0} · 藏 ${it.collectedCount || 0} · 评 ${it.commentCount || 0}`);
-    L.push(`图片：${(n.imageList || []).length} 张`);
+    if (n.type === 'video' || n.video) L.push(`类型：视频笔记`);
+    else L.push(`图片：${(n.imageList || []).length} 张`);
     L.push(`链接：https://www.xiaohongshu.com/explore/${d.id}`);
     L.push(`存档：${fmtDate(Date.now())}`);
 
@@ -253,20 +299,25 @@
     return '\ufeff' + L.join(NL);
   }
 
-  /* ==================== 抓图（只打 CDN） ==================== */
+  /* ==================== 抓取通用方法 ==================== */
   const EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif', 'image/avif': 'avif' };
-  const ALL_EXT = ['jpg', 'png', 'webp', 'gif', 'avif'];
 
-  const fetchBlob = (url) =>
+  const fetchBlob = (url, isVideo = false) =>
     new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
-        method: 'GET', url, responseType: 'blob', timeout: 30000,
-        headers: { Referer: 'https://www.xiaohongshu.com/' },
+        method: 'GET', url, responseType: 'blob', timeout: isVideo ? 180000 : 30000,
+        headers: { Referer: location.origin + '/' },
+        onprogress: (e) => {
+          if (isVideo && e.lengthComputable) {
+            const pct = Math.round((e.loaded / e.total) * 100);
+            setText(`下载视频 ${pct}%`);
+          }
+        },
         onload: (r) => {
           if (r.status !== 200) return reject(new Error('HTTP ' + r.status));
           const b = r.response;
-          if (!b || !b.type.startsWith('image/') || b.size < 1024)
-            return reject(new Error(`bad body: ${b && b.type} ${b && b.size}B`));
+          if (!b || b.size < 1024) return reject(new Error(`bad body size: ${b && b.size}B`));
+          if (!isVideo && !b.type.startsWith('image/')) return reject(new Error(`bad body type: ${b.type}`));
           resolve(b);
         },
         onerror: () => reject(new Error('network')),
@@ -274,13 +325,13 @@
       });
     });
 
-  async function fetchAny(cands, idx) {
+  async function fetchAny(cands, idx, isVideo = false) {
     const log = [];
     for (const url of cands) {
-      try { return { blob: await fetchBlob(url), url }; }
+      try { return { blob: await fetchBlob(url, isVideo), url }; }
       catch (e) { log.push(`  ${e.message}  ${url}`); }
     }
-    console.warn(`[XHS] 第${idx}张 全部候选失败:${NL}` + log.join(NL));
+    console.warn(`[XHS] 第${idx}个资源 全部候选失败:${NL}` + log.join(NL));
     return null;
   }
 
@@ -308,7 +359,8 @@
     await w.write(blob); await w.close();
   }
   async function anyExists(dir, stem) {
-    for (const e of ALL_EXT) {
+    const extensions = ['mp4', 'mkv', 'webm', 'mov', 'jpg', 'png', 'webp', 'gif', 'avif'];
+    for (const e of extensions) {
       try { await dir.getFileHandle(`${stem}.${e}`); return true; } catch (err) {}
     }
     return false;
@@ -317,7 +369,7 @@
     return new Promise((resolve) => {
       GM_download({
         url, name: path, saveAs: false,
-        headers: { Referer: 'https://www.xiaohongshu.com/' },
+        headers: { Referer: location.origin + '/' },
         onload: () => resolve(true),
         onerror: (e) => { console.warn('[XHS] GM_download 失败', path, e); resolve(false); },
         ontimeout: () => resolve(false),
@@ -338,7 +390,6 @@
       const d = readState();
       if (!d) { setText('没读到笔记数据'); return; }
 
-      // 权限申请要趁点击手势还有效
       let dir = null;
       if (FSA_OK) {
         if (!rootHandle) {
@@ -364,28 +415,61 @@
         if (dir) await writeToDir(dir, 'note.json', js); else anchorSave(js, 'note.json');
       }
 
-      const imgs = (d.note.imageList || []).map(urlCandidates);
       let ok = 0, skip = 0;
-      for (let i = 0; i < imgs.length; i++) {
-        const stem = String(i + 1).padStart(2, '0');
-        if (dir && CONFIG.skipExisting && await anyExists(dir, stem)) { skip++; ok++; continue; }
+      const isVideoNote = d.note.type === 'video' || Boolean(d.note.video);
 
-        setText(`下载图片 ${i + 1}/${imgs.length}`);
-        const got = await fetchAny(imgs[i], i + 1);
-        if (got) {
-          try {
-            const blob = await toPng(got.blob);
-            const file = `${stem}.${EXT[blob.type] || 'jpg'}`;
-            if (dir) { await writeToDir(dir, file, blob); ok++; }
-            else if (await gmDownload(got.url, `xiaohongshu/${folder}/${file}`)) ok++;
-          } catch (e) { console.warn('[XHS] 保存失败', i + 1, e); }
+      if (isVideoNote) {
+        const vCands = videoCandidates(d.note);
+        const stem = 'video_01';
+        if (dir && CONFIG.skipExisting && await anyExists(dir, stem)) {
+          skip++; ok++;
+        } else {
+          setText('准备下载视频…');
+          const got = await fetchAny(vCands, 1, true);
+          if (got) {
+            try {
+              const file = `${stem}.mp4`;
+              if (dir) { await writeToDir(dir, file, got.blob); ok++; }
+              else if (await gmDownload(got.url, `xiaohongshu/${folder}/${file}`)) ok++;
+            } catch (e) { console.warn('[XHS] 视频保存失败', e); }
+          }
         }
-        await sleep(jitter(CONFIG.imageDelay));
-      }
 
-      const where = dir ? `${rootHandle.name}/${folder}` : `下载目录/xiaohongshu/${folder}`;
-      console.log(`[XHS] 图片 ${ok}/${imgs.length}${skip ? `（跳过已有 ${skip}）` : ''}，评论 ${kept.length} → ${where}`);
-      setText(`完成 ${ok}图${kept.length ? ' ' + kept.length + '评' : ''}${skip ? `（跳${skip}）` : ''}`);
+        // 若开启保存视频封面
+        if (CONFIG.saveVideoCover && d.note.imageList && d.note.imageList.length) {
+          const coverGot = await fetchAny(urlCandidates(d.note.imageList[0]), 0, false);
+          if (coverGot && dir) {
+            const cBlob = await toPng(coverGot.blob);
+            await writeToDir(dir, `cover.${EXT[cBlob.type] || 'jpg'}`, cBlob);
+          }
+        }
+
+        const where = dir ? `${rootHandle.name}/${folder}` : `下载目录/xiaohongshu/${folder}`;
+        console.log(`[XHS] 视频 ${ok}/1，评论 ${kept.length} → ${where}`);
+        setText(ok ? `完成 1视频${kept.length ? ' ' + kept.length + '评' : ''}${skip ? '（跳过）' : ''}` : '视频下载失败');
+      } else {
+        const imgs = (d.note.imageList || []).map(urlCandidates);
+        for (let i = 0; i < imgs.length; i++) {
+          const stem = String(i + 1).padStart(2, '0');
+          if (dir && CONFIG.skipExisting && await anyExists(dir, stem)) { skip++; ok++; continue; }
+
+          setText(`下载图片 ${i + 1}/${imgs.length}`);
+          const got = await fetchAny(imgs[i], i + 1, false);
+          if (got) {
+            try {
+              const blob = await toPng(got.blob);
+              const file = `${stem}.${EXT[blob.type] || 'jpg'}`;
+              if (dir) { await writeToDir(dir, file, blob); ok++; }
+              else if (await gmDownload(got.url, `xiaohongshu/${folder}/${file}`)) ok++;
+            } catch (e) { console.warn('[XHS] 保存失败', i + 1, e); }
+          }
+          await sleep(jitter(CONFIG.imageDelay));
+        }
+
+        const where = dir ? `${rootHandle.name}/${folder}` : `下载目录/xiaohongshu/${folder}`;
+        console.log(`[XHS] 图片 ${ok}/${imgs.length}${skip ? `（跳过已有 ${skip}）` : ''}，评论 ${kept.length} → ${where}`);
+        setText(`完成 ${ok}图${kept.length ? ' ' + kept.length + '评' : ''}${skip ? `（跳${skip}）` : ''}`);
+      }
     } catch (e) {
       console.error('[XHS] 出错', e);
       setText('出错，见控制台');

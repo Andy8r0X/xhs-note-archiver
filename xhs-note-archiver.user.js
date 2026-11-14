@@ -1,6 +1,6 @@
 // ==UserScript==
-// @name         小红书笔记存档 XHS Note Archiver (含视频/图片/正文)
-// @namespace    https://github.com/firmamento73/xhs-note-archiver
+// @name         小红书笔记存档 XHS Note Archiver (含视频下载)
+// @namespace    https://github.com/Andy8r0X/xhs-note-archiver
 // @version      1.2.0
 // @description  把当前笔记的图片、视频和正文存到指定文件夹，每篇一个子目录。不调用任何分页接口。
 // @match        *://*.rednote.com/*
@@ -13,6 +13,8 @@
 // @run-at       document-idle
 // @author       firmamento73, Andy8r0X (Modified)
 // @license      MIT
+// @homepageURL  https://github.com/Andy8r0X/xhs-note-archiver
+// @supportURL   https://github.com/Andy8r0X/xhs-note-archiver/issues
 // ==/UserScript==
 
 /*

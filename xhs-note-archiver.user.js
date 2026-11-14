@@ -11,7 +11,7 @@
 // @connect      rednotecdn.com
 // @connect      xhslink.com
 // @run-at       document-idle
-// @author       firmamento73 (Modified)
+// @author       firmamento73, Andy8r0X (Modified)
 // @license      MIT
 // ==/UserScript==
 
